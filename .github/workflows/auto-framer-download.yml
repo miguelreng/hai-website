@@ -1,0 +1,322 @@
+name: Download Framer Export via Share URL
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+    inputs:
+      share_url:
+        description: 'Framer share URL (optional - will use stored URL if empty)'
+        required: false
+        type: string
+      force_download:
+        description: 'Force download even if no changes detected'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  download-framer:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Install dependencies
+      run: |
+        npm init -y
+        npm install axios jszip cheerio
+    
+    - name: Create download script
+      run: |
+        cat > download-framer.js << 'EOF'
+        const axios = require('axios');
+        const JSZip = require('jszip');
+        const cheerio = require('cheerio');
+        const fs = require('fs').promises;
+        const path = require('path');
+        const crypto = require('crypto');
+        
+        async function downloadFramerExport() {
+          try {
+            // Get the share URL from input or environment
+            const shareUrl = process.env.SHARE_URL || process.env.FRAMER_SHARE_URL;
+            
+            if (!shareUrl) {
+              throw new Error('No share URL provided. Please provide FRAMER_SHARE_URL secret or share_url input.');
+            }
+            
+            console.log('🔗 Using share URL:', shareUrl);
+            
+            // Step 1: Fetch the share page to get download link
+            console.log('📄 Fetching share page...');
+            const response = await axios.get(shareUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+              }
+            });
+            
+            const $ = cheerio.load(response.data);
+            
+            // Step 2: Find download link
+            console.log('🔍 Looking for download link...');
+            
+            let downloadUrl = null;
+            
+            // Try different methods to find download URL
+            const possibleSelectors = [
+              'a[href*="download"]',
+              'a[href*="export"]',
+              'a[href*=".zip"]',
+              'button[data-download]',
+              '[data-testid="download-link"]'
+            ];
+            
+            for (const selector of possibleSelectors) {
+              const element = $(selector);
+              if (element.length > 0) {
+                downloadUrl = element.attr('href') || element.attr('data-href');
+                if (downloadUrl) {
+                  console.log('✅ Found download link via selector:', selector);
+                  break;
+                }
+              }
+            }
+            
+            // Alternative: Look for download URL in JavaScript/JSON
+            if (!downloadUrl) {
+              const scriptTags = $('script');
+              scriptTags.each((i, script) => {
+                const content = $(script).html();
+                if (content) {
+                  // Look for download URLs in script content
+                  const urlMatches = content.match(/https:\/\/[^"'\s]+\.zip/g);
+                  if (urlMatches && urlMatches.length > 0) {
+                    downloadUrl = urlMatches[0];
+                    console.log('✅ Found download URL in script:', downloadUrl);
+                    return false; // break
+                  }
+                  
+                  // Look for API endpoints
+                  const apiMatches = content.match(/["']([^"']*\/api\/[^"']*download[^"']*)["']/g);
+                  if (apiMatches && apiMatches.length > 0) {
+                    downloadUrl = apiMatches[0].replace(/["']/g, '');
+                    console.log('✅ Found API download URL:', downloadUrl);
+                    return false; // break
+                  }
+                }
+              });
+            }
+            
+            // Alternative: Try direct download by modifying share URL
+            if (!downloadUrl) {
+              console.log('🔄 Trying direct download URL construction...');
+              
+              // Extract project ID from share URL
+              const projectIdMatch = shareUrl.match(/\/([a-zA-Z0-9-_]+)\/?$/);
+              if (projectIdMatch) {
+                const projectId = projectIdMatch[1];
+                
+                // Try common download URL patterns
+                const downloadPatterns = [
+                  `https://framer.com/api/projects/${projectId}/export`,
+                  `https://framer.com/projects/${projectId}/download`,
+                  `https://api.framer.com/v1/projects/${projectId}/export`,
+                  shareUrl.replace(/\/$/, '') + '/download',
+                  shareUrl.replace(/\/$/, '') + '/export'
+                ];
+                
+                for (const pattern of downloadPatterns) {
+                  try {
+                    const testResponse = await axios.head(pattern);
+                    if (testResponse.status === 200) {
+                      downloadUrl = pattern;
+                      console.log('✅ Found working download URL:', downloadUrl);
+                      break;
+                    }
+                  } catch (e) {
+                    // Continue to next pattern
+                  }
+                }
+              }
+            }
+            
+            if (!downloadUrl) {
+              throw new Error('Could not find download URL. The share URL might not have export enabled.');
+            }
+            
+            // Make download URL absolute if relative
+            if (downloadUrl.startsWith('/')) {
+              const baseUrl = new URL(shareUrl).origin;
+              downloadUrl = baseUrl + downloadUrl;
+            }
+            
+            console.log('📥 Download URL:', downloadUrl);
+            
+            // Step 3: Check if we need to download (compare with last version)
+            if (process.env.FORCE_DOWNLOAD !== 'true') {
+              console.log('🔍 Checking for changes...');
+              
+              try {
+                // Get file hash/size to compare
+                const headResponse = await axios.head(downloadUrl);
+                const contentLength = headResponse.headers['content-length'];
+                const lastModified = headResponse.headers['last-modified'];
+                
+                const currentSignature = crypto.createHash('md5')
+                  .update(contentLength + lastModified)
+                  .digest('hex');
+                
+                try {
+                  const lastSignature = await fs.readFile('.last-download-signature', 'utf8');
+                  if (currentSignature === lastSignature.trim()) {
+                    console.log('⏭️  No changes detected, skipping download');
+                    return false;
+                  }
+                } catch (e) {
+                  console.log('📝 First download or no previous signature found');
+                }
+                
+                // Save new signature
+                await fs.writeFile('.last-download-signature', currentSignature);
+                
+              } catch (e) {
+                console.log('⚠️  Could not check for changes, proceeding with download');
+              }
+            }
+            
+            // Step 4: Download the file
+            console.log('⬇️  Downloading export...');
+            
+            const downloadResponse = await axios.get(downloadUrl, {
+              responseType: 'arraybuffer',
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': shareUrl
+              },
+              timeout: 60000 // 60 seconds timeout
+            });
+            
+            if (downloadResponse.status !== 200) {
+              throw new Error(`Download failed with status: ${downloadResponse.status}`);
+            }
+            
+            console.log('✅ Download completed!');
+            
+            // Step 5: Extract files
+            console.log('📦 Extracting files...');
+            
+            const zipBuffer = Buffer.from(downloadResponse.data);
+            const zip = new JSZip();
+            const zipContents = await zip.loadAsync(zipBuffer);
+            
+            // Clean existing files (except important ones)
+            const filesToKeep = [
+              '.git', '.github', 'README.md', '.gitignore', 
+              'package.json', '.last-download-signature', 
+              'node_modules', '.env'
+            ];
+            
+            const existingFiles = await fs.readdir('.').catch(() => []);
+            
+            for (const file of existingFiles) {
+              if (!filesToKeep.includes(file)) {
+                await fs.rm(file, { recursive: true, force: true });
+              }
+            }
+            
+            // Extract new files
+            console.log('📂 Extracting files...');
+            const promises = [];
+            
+            zipContents.forEach((relativePath, file) => {
+              if (!file.dir) {
+                const promise = file.async('nodebuffer').then(async (content) => {
+                  const filePath = path.join('.', relativePath);
+                  await fs.mkdir(path.dirname(filePath), { recursive: true });
+                  await fs.writeFile(filePath, content);
+                  console.log('📄 Extracted:', relativePath);
+                });
+                promises.push(promise);
+              }
+            });
+            
+            await Promise.all(promises);
+            
+            // Step 6: Post-process files (optional)
+            console.log('🔧 Post-processing files...');
+            
+            // Add any custom processing here
+            // For example, inject analytics code, modify paths, etc.
+            
+            console.log('🎉 Export completed successfully!');
+            return true;
+            
+          } catch (error) {
+            console.error('❌ Download failed:', error.message);
+            
+            // Log additional debug info
+            if (error.response) {
+              console.error('Response status:', error.response.status);
+              console.error('Response headers:', error.response.headers);
+            }
+            
+            throw error;
+          }
+        }
+        
+        // Run the download
+        downloadFramerExport()
+          .then(success => {
+            if (success !== false) {
+              console.log('✅ Process completed successfully');
+              process.exit(0);
+            } else {
+              console.log('⏭️  No download needed');
+              process.exit(0);
+            }
+          })
+          .catch(error => {
+            console.error('💥 Process failed:', error.message);
+            process.exit(1);
+          });
+        EOF
+    
+    - name: Run download
+      env:
+        FRAMER_SHARE_URL: ${{ secrets.FRAMER_SHARE_URL }}
+        SHARE_URL: ${{ github.event.inputs.share_url }}
+        FORCE_DOWNLOAD: ${{ github.event.inputs.force_download }}
+      run: node download-framer.js
+    
+    - name: Commit and push changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Check if there are any changes
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "📝 Changes detected, committing..."
+          git add .
+          git commit -m "🚀 Auto-update from Framer export $(date '+%Y-%m-%d %H:%M:%S')"
+          git push
+          echo "✅ Changes pushed successfully"
+        else
+          echo "⏭️  No changes to commit"
+        fi
+    
+    - name: Deploy to GitHub Pages
+      if: success()
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./
+        exclude_assets: '.github,node_modules,*.js,package*.json,.last-download-signature'
