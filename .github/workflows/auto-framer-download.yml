@@ -45,6 +45,28 @@ jobs:
         const path = require('path');
         const crypto = require('crypto');
         
+        // Helper function to find files by extension
+        async function findFiles(dir, extension) {
+          const files = [];
+          
+          async function scanDir(currentDir) {
+            const entries = await fs.readdir(currentDir, { withFileTypes: true });
+            
+            for (const entry of entries) {
+              const fullPath = path.join(currentDir, entry.name);
+              
+              if (entry.isDirectory() && !entry.name.startsWith('.')) {
+                await scanDir(fullPath);
+              } else if (entry.isFile() && entry.name.endsWith(extension)) {
+                files.push(fullPath);
+              }
+            }
+          }
+          
+          await scanDir(dir);
+          return files;
+        }
+        
         async function downloadFramerExport() {
           try {
             // Get the share URL from input or environment
@@ -251,10 +273,92 @@ jobs:
             
             await Promise.all(promises);
             
-            // Step 6: Post-process files (optional)
+            // Step 6: Post-process files (remove Framer badge and other customizations)
             console.log('🔧 Post-processing files...');
             
-            // Add any custom processing here
+            // Remove Framer badge from HTML files
+            const htmlFiles = await findFiles('.', '.html');
+            
+            for (const htmlFile of htmlFiles) {
+              try {
+                let content = await fs.readFile(htmlFile, 'utf8');
+                
+                // Remove Framer badge container
+                content = content.replace(
+                  /<div[^>]*id="__framer-badge-container"[^>]*>[\s\S]*?<\/div>/gi,
+                  ''
+                );
+                
+                // Remove any other Framer badge references
+                content = content.replace(
+                  /<div[^>]*class="[^"]*framer-badge[^"]*"[^>]*>[\s\S]*?<\/div>/gi,
+                  ''
+                );
+                
+                // Remove "Made in Framer" text references
+                content = content.replace(
+                  /Made in Framer/gi,
+                  ''
+                );
+                
+                // Clean up any empty containers left behind
+                content = content.replace(
+                  /<div[^>]*>\s*<\/div>/gi,
+                  ''
+                );
+                
+                // Remove related CSS that might be styling the badge
+                content = content.replace(
+                  /#__framer-badge-container[^}]*}/gi,
+                  ''
+                );
+                
+                content = content.replace(
+                  /\.__framer-badge[^}]*}/gi,
+                  ''
+                );
+                
+                await fs.writeFile(htmlFile, content);
+                console.log('🏷️  Removed Framer badge from:', htmlFile);
+                
+              } catch (error) {
+                console.warn('⚠️  Could not process HTML file:', htmlFile, error.message);
+              }
+            }
+            
+            // Find and remove any separate badge CSS files
+            const cssFiles = await findFiles('.', '.css');
+            
+            for (const cssFile of cssFiles) {
+              try {
+                let content = await fs.readFile(cssFile, 'utf8');
+                
+                // Remove Framer badge CSS rules
+                content = content.replace(
+                  /#__framer-badge-container[^}]*}/gi,
+                  ''
+                );
+                
+                content = content.replace(
+                  /\.__framer-badge[^}]*}/gi,
+                  ''
+                );
+                
+                // Remove any CSS rules that mention "framer-badge"
+                content = content.replace(
+                  /[^}]*framer-badge[^}]*}/gi,
+                  ''
+                );
+                
+                await fs.writeFile(cssFile, content);
+                console.log('🎨 Cleaned badge CSS from:', cssFile);
+                
+              } catch (error) {
+                console.warn('⚠️  Could not process CSS file:', cssFile, error.message);
+              }
+            }
+            
+            // Additional customizations can be added here
             // For example, inject analytics code, modify paths, etc.
             
             console.log('🎉 Export completed successfully!');
